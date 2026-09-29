@@ -1,5 +1,6 @@
 import time
 from datetime import datetime
+from pathlib import Path
 
 import joblib
 import matplotlib.pyplot as plt
@@ -25,107 +26,158 @@ DARK_CSS = """
     h1, h2, h3, h4 { color: #E8EEF2 !important; font-family: 'Consolas', monospace; }
     div[data-testid="stMetricValue"] { color: #1B9AAA; font-family: 'Consolas', monospace; }
     div[data-testid="stMetricLabel"] { color: #9DB0BD; }
-    .status-active {
-        color: #2ECC71; font-weight: bold; font-family: 'Consolas', monospace;
-    }
-    .alert-row-attack { background-color: rgba(240,80,60,0.15); padding: 6px; border-radius: 4px; }
-    .alert-row-benign { background-color: rgba(27,154,170,0.08); padding: 6px; border-radius: 4px; }
+    .status-active { color: #2ECC71; font-weight: bold; font-family: 'Consolas', monospace; }
+    .alert-row-attack { background-color: rgba(240,80,60,0.15); padding: 6px; border-radius: 4px; margin-bottom: 4px; }
+    .alert-row-benign { background-color: rgba(27,154,170,0.08); padding: 6px; border-radius: 4px; margin-bottom: 4px; }
     .block-container { padding-top: 1.5rem; }
     hr { border-color: #29405A; }
 </style>
 """
 st.markdown(DARK_CSS, unsafe_allow_html=True)
 
+ARTIFACT_DIR = Path(__file__).parent / "model_artifacts"
+
+
 # ─────────────────────────────────────────────────────────────────────────
-# LOAD MODEL ARTIFACTS
+# LOAD MODEL ARTIFACTS  (no sample_flows.csv needed)
 # ─────────────────────────────────────────────────────────────────────────
 @st.cache_resource
 def load_artifacts():
-    model = joblib.load("model_artifacts/xgboost_xids_model_pso.pkl")
-    scaler = joblib.load("model_artifacts/scaler.pkl")
-    le = joblib.load("model_artifacts/label_encoder.pkl")
-    selected_features = joblib.load("model_artifacts/pso_selected_features.pkl")
-    selected_mask = joblib.load("model_artifacts/pso_selected_mask.pkl")
-    all_feature_columns = joblib.load("model_artifacts/all_feature_columns.pkl")
+    model = joblib.load(ARTIFACT_DIR / "xgboost_xids_model_pso.pkl")
+    scaler = joblib.load(ARTIFACT_DIR / "scaler.pkl")
+    le = joblib.load(ARTIFACT_DIR / "label_encoder.pkl")
+    selected_features = list(joblib.load(ARTIFACT_DIR / "pso_selected_features.pkl"))
+    selected_mask = np.asarray(joblib.load(ARTIFACT_DIR / "pso_selected_mask.pkl"))
+    all_feature_columns = list(joblib.load(ARTIFACT_DIR / "all_feature_columns.pkl"))
+
+    # Model was trained on GPU; Streamlit Cloud is CPU only
+    try:
+        model.set_params(device="cpu")
+    except Exception:
+        pass
+
     explainer = shap.TreeExplainer(model)
     return model, scaler, le, selected_features, selected_mask, all_feature_columns, explainer
 
 
-@st.cache_data
-def load_sample_flows():
-    # Small bundled sample of real (unlabeled-at-inference) test flows used to
-    # simulate a live traffic feed. See README for how this file is generated.
-    return pd.read_csv("model_artifacts/sample_flows.csv")
-
-
 try:
-    model, scaler, le, selected_features, selected_mask, all_feature_columns, explainer = load_artifacts()
-    sample_flows = load_sample_flows()
+    (model, scaler, le, selected_features, selected_mask,
+     all_feature_columns, explainer) = load_artifacts()
     ARTIFACTS_OK = True
 except Exception as e:
     ARTIFACTS_OK = False
     LOAD_ERROR = str(e)
 
+
 # ─────────────────────────────────────────────────────────────────────────
 # SESSION STATE
 # ─────────────────────────────────────────────────────────────────────────
-if "flows_analyzed" not in st.session_state:
-    st.session_state.flows_analyzed = 0
-if "alerts_triggered" not in st.session_state:
-    st.session_state.alerts_triggered = 0
-if "latencies" not in st.session_state:
-    st.session_state.latencies = []
-if "alert_log" not in st.session_state:
-    st.session_state.alert_log = []
-if "last_result" not in st.session_state:
-    st.session_state.last_result = None
-if "live_mode" not in st.session_state:
-    st.session_state.live_mode = False
-if "start_time" not in st.session_state:
-    st.session_state.start_time = time.time()
+def _init_state():
+    defaults = {
+        "flows_analyzed": 0,
+        "alerts_triggered": 0,
+        "latencies": [],
+        "alert_log": [],
+        "last_result": None,
+        "live_mode": False,
+        "start_time": time.time(),
+        "manual_defaults": {},
+        "manual_version": 0,
+        "uploaded_df": None,
+        "rng_seed": int(time.time()) % 100000,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+_init_state()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# FLOW SOURCES
+# ─────────────────────────────────────────────────────────────────────────
+def synthetic_flow(rng):
+    """
+    Random demo flow built from the scaler's own statistics (mean / std of the
+    training data). NOT real traffic — it only exercises the pipeline.
+    """
+    z = rng.normal(size=len(all_feature_columns)) * rng.choice([0.5, 1.0, 2.5])
+    raw = z * scaler.scale_ + scaler.mean_
+    raw = np.maximum(raw, 0)
+    return pd.DataFrame([raw], columns=all_feature_columns)
+
+
+def next_flow(source):
+    if source == "Uploaded CSV" and st.session_state.uploaded_df is not None:
+        return st.session_state.uploaded_df.sample(1).reset_index(drop=True)
+    rng = np.random.default_rng()
+    return synthetic_flow(rng)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# INFERENCE + EXPLANATION
+# ─────────────────────────────────────────────────────────────────────────
+def class_shap(sv, pred_idx):
+    """Return SHAP values (n_features,) for the predicted class across shap versions."""
+    if isinstance(sv, list):
+        return np.array(sv[pred_idx])[0]
+    sv = np.array(sv)
+    if sv.ndim == 3:                 # (n_samples, n_features, n_classes)
+        return sv[0, :, pred_idx]
+    return sv[0]
 
 
 def run_inference(raw_row_df):
     row_scaled = scaler.transform(raw_row_df[all_feature_columns])
     row_selected = row_scaled[:, selected_mask]
 
-    t0 = time.time()
+    t0 = time.perf_counter()
     pred = model.predict(row_selected)
     pred_proba = model.predict_proba(row_selected)
-    t1 = time.time()
+    t1 = time.perf_counter()
     shap_values = explainer.shap_values(row_selected)
-    t2 = time.time()
+    t2 = time.perf_counter()
 
-    predicted_class = le.inverse_transform(pred)[0]
-    confidence = float(pred_proba[0][pred[0]] * 100)
-
+    pred_idx = int(pred[0])
     return {
-        "class": predicted_class,
-        "confidence": confidence,
+        "class": str(le.inverse_transform(pred)[0]),
+        "confidence": float(pred_proba[0][pred_idx] * 100),
         "inference_ms": (t1 - t0) * 1000,
         "explain_ms": (t2 - t1) * 1000,
         "total_ms": (t2 - t0) * 1000,
-        "shap_values": shap_values,
-        "row_selected": row_selected,
+        "shap_vals": class_shap(shap_values, pred_idx),
     }
+
+
+def is_attack_class(name):
+    return name.strip().lower() != "benign"
 
 
 def log_result(result, source_label="live"):
     st.session_state.flows_analyzed += 1
     st.session_state.latencies.append(result["total_ms"])
-    is_attack = result["class"].strip().lower() != "benign"
-    if is_attack:
+    attack = is_attack_class(result["class"])
+    if attack:
         st.session_state.alerts_triggered += 1
     st.session_state.alert_log.insert(0, {
         "time": datetime.now().strftime("%H:%M:%S"),
         "class": result["class"],
         "confidence": f'{result["confidence"]:.1f}%',
         "latency_ms": f'{result["total_ms"]:.2f}',
-        "is_attack": is_attack,
+        "is_attack": attack,
         "source": source_label,
     })
     st.session_state.alert_log = st.session_state.alert_log[:25]
     st.session_state.last_result = result
+
+
+def reset_stats():
+    st.session_state.flows_analyzed = 0
+    st.session_state.alerts_triggered = 0
+    st.session_state.latencies = []
+    st.session_state.alert_log = []
+    st.session_state.last_result = None
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -150,57 +202,107 @@ st.markdown("<hr>", unsafe_allow_html=True)
 
 if not ARTIFACTS_OK:
     st.error(
-        "Model artifacts not found. Make sure `model_artifacts/` contains all "
-        "required .pkl files and sample_flows.csv (see README).\n\n"
+        "Model artifacts could not be loaded. Make sure the `model_artifacts/` folder "
+        "(next to app.py) contains: xgboost_xids_model_pso.pkl, scaler.pkl, "
+        "label_encoder.pkl, pso_selected_features.pkl, pso_selected_mask.pkl, "
+        "all_feature_columns.pkl.\n\n"
         f"Details: {LOAD_ERROR}"
     )
     st.stop()
 
+
 # ─────────────────────────────────────────────────────────────────────────
 # SIDEBAR — CONTROLS
 # ─────────────────────────────────────────────────────────────────────────
+refresh_rate = 2.0
+source = "Synthetic demo flows"
+
 with st.sidebar:
     st.markdown("### ⚙️ Control Panel")
     mode = st.radio("Mode", ["🔴 Live Traffic Simulation", "🧪 Manual Flow Testing"])
     st.markdown("---")
 
     if mode.startswith("🔴"):
+        source = st.radio("Flow source", ["Synthetic demo flows", "Uploaded CSV"])
+
+        if source == "Uploaded CSV":
+            up = st.file_uploader("Upload raw (unscaled) flows CSV", type="csv")
+            if up is not None:
+                df_up = pd.read_csv(up)
+                df_up.columns = df_up.columns.str.strip()
+                df_up = df_up.replace([np.inf, -np.inf], np.nan).dropna()
+                missing = [c for c in all_feature_columns if c not in df_up.columns]
+                if missing:
+                    st.error(f"CSV is missing {len(missing)} required columns "
+                             f"(e.g. {missing[:3]}).")
+                    st.session_state.uploaded_df = None
+                else:
+                    st.session_state.uploaded_df = df_up[all_feature_columns]
+                    st.success(f"Loaded {len(df_up):,} flows.")
+            if st.session_state.uploaded_df is None:
+                st.caption("No valid CSV yet — falling back to synthetic flows.")
+        else:
+            st.caption("Random flows generated from the training-data statistics. "
+                       "They exercise the pipeline but are not real traffic, so the "
+                       "predicted classes will not be meaningful.")
+
         refresh_rate = st.slider("Simulated flow interval (seconds)", 1.0, 5.0, 2.0, 0.5)
-        st.session_state.live_mode = st.toggle("▶ Start live monitoring", value=st.session_state.live_mode)
-        st.caption("Pulls a random flow from a held-out real traffic sample every interval, "
-                   "runs it through the full detect + explain pipeline.")
+        st.session_state.live_mode = st.toggle("▶ Start live monitoring",
+                                               value=st.session_state.live_mode)
     else:
         st.session_state.live_mode = False
-        st.caption("Manually set feature values and classify a single custom flow on demand.")
+        st.caption("Set feature values and classify a single custom flow on demand.")
 
     st.markdown("---")
     st.markdown("### 📊 Model Info")
-    st.caption(f"**Classifier:** XGBoost")
-    st.caption(f"**Explainer:** SHAP TreeExplainer")
+    st.caption("**Classifier:** XGBoost")
+    st.caption("**Explainer:** SHAP TreeExplainer")
     st.caption(f"**Features used:** {len(selected_features)} (PSO-selected)")
     st.caption(f"**Classes:** {len(le.classes_)}")
 
     if st.button("🔄 Reset session stats"):
-        for k in ["flows_analyzed", "alerts_triggered", "latencies", "alert_log", "last_result"]:
-            st.session_state[k] = 0 if "analyzed" in k or "triggered" in k else ([] if isinstance(st.session_state[k], list) else None)
+        reset_stats()
         st.rerun()
 
-# ─────────────────────────────────────────────────────────────────────────
-# TOP METRICS ROW
-# ─────────────────────────────────────────────────────────────────────────
-avg_latency = np.mean(st.session_state.latencies) if st.session_state.latencies else 0
-detection_rate = (
-    (st.session_state.alerts_triggered / st.session_state.flows_analyzed * 100)
-    if st.session_state.flows_analyzed else 0
-)
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Flows Analyzed", f"{st.session_state.flows_analyzed:,}")
-m2.metric("Alerts Triggered", f"{st.session_state.alerts_triggered:,}")
-m3.metric("Avg Latency", f"{avg_latency:.2f} ms")
-m4.metric("Alert Rate", f"{detection_rate:.1f}%")
-
+# ─────────────────────────────────────────────────────────────────────────
+# TOP METRICS ROW (placeholder, filled after the flow is processed so the
+# counters are always up to date)
+# ─────────────────────────────────────────────────────────────────────────
+metrics_ph = st.container()
 st.markdown("<hr>", unsafe_allow_html=True)
+
+
+def render_top_metrics():
+    avg_latency = float(np.mean(st.session_state.latencies)) if st.session_state.latencies else 0.0
+    alert_rate = (st.session_state.alerts_triggered / st.session_state.flows_analyzed * 100
+                  if st.session_state.flows_analyzed else 0.0)
+    with metrics_ph:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Flows Analyzed", f"{st.session_state.flows_analyzed:,}")
+        m2.metric("Alerts Triggered", f"{st.session_state.alerts_triggered:,}")
+        m3.metric("Avg Latency", f"{avg_latency:.2f} ms")
+        m4.metric("Alert Rate", f"{alert_rate:.1f}%")
+
+
+def render_result_card(r, show_latency_breakdown=True):
+    attack = is_attack_class(r["class"])
+    color = "#F0503C" if attack else "#2ECC71"
+    text = "⚠ THREAT DETECTED" if attack else "✓ NORMAL TRAFFIC"
+    st.markdown(
+        f"<div style='padding:16px;border-radius:8px;background-color:#16283D;"
+        f"border-left:4px solid {color}'>"
+        f"<span style='color:{color};font-weight:bold;font-family:monospace'>{text}</span><br>"
+        f"<span style='font-size:22px;font-weight:bold'>{r['class']}</span><br>"
+        f"<span style='color:#9DB0BD'>Confidence: {r['confidence']:.2f}%</span>"
+        f"</div>", unsafe_allow_html=True
+    )
+    if show_latency_breakdown:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Inference", f"{r['inference_ms']:.2f} ms")
+        c2.metric("Explanation", f"{r['explain_ms']:.2f} ms")
+        c3.metric("Total Latency", f"{r['total_ms']:.2f} ms")
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # MAIN CONTENT
@@ -210,109 +312,72 @@ left, right = st.columns([1.3, 1])
 with left:
     if mode.startswith("🔴"):
         st.markdown("#### 📡 Incoming Flow")
-        placeholder_flow = st.empty()
-
         if st.session_state.live_mode:
-            row = sample_flows.sample(1).reset_index(drop=True)
-            result = run_inference(row)
+            result = run_inference(next_flow(source))
             log_result(result, source_label="live")
 
         if st.session_state.last_result:
-            r = st.session_state.last_result
-            is_attack = r["class"].strip().lower() != "benign"
-            badge_color = "#F0503C" if is_attack else "#2ECC71"
-            badge_text = "⚠ THREAT DETECTED" if is_attack else "✓ NORMAL TRAFFIC"
-
-            with placeholder_flow.container():
-                st.markdown(
-                    f"<div style='padding:16px;border-radius:8px;background-color:#16283D;"
-                    f"border-left:4px solid {badge_color}'>"
-                    f"<span style='color:{badge_color};font-weight:bold;font-family:monospace'>{badge_text}</span><br>"
-                    f"<span style='font-size:22px;font-weight:bold'>{r['class']}</span><br>"
-                    f"<span style='color:#9DB0BD'>Confidence: {r['confidence']:.2f}%</span>"
-                    f"</div>", unsafe_allow_html=True
-                )
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Inference", f"{r['inference_ms']:.2f} ms")
-                c2.metric("Explanation", f"{r['explain_ms']:.2f} ms")
-                c3.metric("Total Latency", f"{r['total_ms']:.2f} ms")
+            render_result_card(st.session_state.last_result)
         else:
-            placeholder_flow.info("Toggle **Start live monitoring** in the sidebar to begin the simulation.")
+            st.info("Toggle **Start live monitoring** in the sidebar to begin the simulation.")
 
     else:
         st.markdown("#### 🧪 Manual Flow Testing")
-        preset = None
-        pcol1, pcol2 = st.columns(2)
-        if pcol1.button("Load Normal Example"):
-            preset = "normal"
-        if pcol2.button("Load Attack Example"):
-            preset = "attack"
+        if st.button("🎲 Load random example flow"):
+            flow = synthetic_flow(np.random.default_rng())
+            st.session_state.manual_defaults = flow.iloc[0].to_dict()
+            st.session_state.manual_version += 1
 
-        defaults = {}
-        if preset == "normal":
-            defaults = sample_flows.iloc[0].to_dict() if len(sample_flows) else {}
-        elif preset == "attack":
-            defaults = sample_flows.iloc[min(1, len(sample_flows)-1)].to_dict() if len(sample_flows) else {}
+        base = dict(zip(all_feature_columns, scaler.mean_))
+        base.update(st.session_state.manual_defaults)
+        ver = st.session_state.manual_version
 
         with st.form("manual_form"):
             user_input = {}
             cols = st.columns(3)
             for i, feat in enumerate(selected_features):
-                default_val = float(defaults.get(feat, 0.0))
-                user_input[feat] = cols[i % 3].number_input(feat, value=default_val, format="%.4f")
+                user_input[feat] = cols[i % 3].number_input(
+                    feat, value=float(base.get(feat, 0.0)),
+                    format="%.4f", key=f"inp_{feat}_{ver}")
             submitted = st.form_submit_button("🚀 Analyze Flow", type="primary")
 
         if submitted:
-            row = pd.DataFrame([{col: user_input.get(col, 0) for col in all_feature_columns}])
-            result = run_inference(row)
+            row_vals = {c: base.get(c, 0.0) for c in all_feature_columns}
+            row_vals.update(user_input)
+            result = run_inference(pd.DataFrame([row_vals]))
             log_result(result, source_label="manual")
-            r = result
-            is_attack = r["class"].strip().lower() != "benign"
-            badge_color = "#F0503C" if is_attack else "#2ECC71"
-            st.markdown(
-                f"<div style='padding:16px;border-radius:8px;background-color:#16283D;"
-                f"border-left:4px solid {badge_color}'>"
-                f"<span style='font-size:22px;font-weight:bold'>{r['class']}</span> "
-                f"<span style='color:#9DB0BD'>({r['confidence']:.2f}% confidence)</span><br>"
-                f"<span style='color:#9DB0BD'>Total latency: {r['total_ms']:.2f} ms</span>"
-                f"</div>", unsafe_allow_html=True
-            )
+            render_result_card(result, show_latency_breakdown=False)
 
-    # SHAP explanation for whichever result is current
+    # SHAP explanation for the current result
     if st.session_state.last_result:
         st.markdown("#### 🔬 Why this prediction — SHAP Explanation")
-        r = st.session_state.last_result
-        sv = r["shap_values"]
-        sv_row = sv[0] if isinstance(sv, list) else sv
-        if isinstance(sv, list):
-            pred_class_idx = list(le.classes_).index(r["class"])
-            vals = np.array(sv[pred_class_idx])[0]
-        else:
-            vals = np.array(sv)[0]
-
+        vals = st.session_state.last_result["shap_vals"]
         order = np.argsort(np.abs(vals))[-10:][::-1]
         fig, ax = plt.subplots(figsize=(6, 4))
         fig.patch.set_facecolor("#0D1B2A")
         ax.set_facecolor("#0D1B2A")
         colors = ["#F0503C" if v > 0 else "#1B9AAA" for v in vals[order]]
-        ax.barh([selected_features[i] for i in order][::-1], vals[order][::-1], color=colors[::-1])
+        ax.barh([selected_features[i] for i in order][::-1],
+                vals[order][::-1], color=colors[::-1])
         ax.tick_params(colors="#E8EEF2")
         ax.set_xlabel("SHAP value (impact on prediction)", color="#E8EEF2")
         for spine in ax.spines.values():
             spine.set_color("#29405A")
+        fig.tight_layout()
         st.pyplot(fig)
+        plt.close(fig)
 
 with right:
     st.markdown("#### 🚨 Live Alert Log")
     if st.session_state.alert_log:
         for entry in st.session_state.alert_log:
-            css_class = "alert-row-attack" if entry["is_attack"] else "alert-row-benign"
+            css = "alert-row-attack" if entry["is_attack"] else "alert-row-benign"
             icon = "⚠️" if entry["is_attack"] else "✓"
             st.markdown(
-                f"<div class='{css_class}'>{icon} <b>{entry['time']}</b> — {entry['class']} "
-                f"<span style='color:#9DB0BD'>({entry['confidence']}, {entry['latency_ms']} ms, {entry['source']})</span></div>",
-                unsafe_allow_html=True
-            )
+                f"<div class='{css}'>{icon} <b>{entry['time']}</b> — {entry['class']} "
+                f"<span style='color:#9DB0BD'>({entry['confidence']}, "
+                f"{entry['latency_ms']} ms, {entry['source']})</span></div>",
+                unsafe_allow_html=True)
     else:
         st.info("No flows analyzed yet this session.")
 
@@ -321,6 +386,9 @@ with right:
         st.line_chart(pd.DataFrame({"latency_ms": st.session_state.latencies[-40:]}))
     else:
         st.caption("Latency chart appears after a few flows are analyzed.")
+
+
+render_top_metrics()
 
 # ─────────────────────────────────────────────────────────────────────────
 # AUTO-REFRESH LOOP FOR LIVE MODE
