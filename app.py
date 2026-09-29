@@ -41,14 +41,29 @@ ARTIFACT_DIR = Path(__file__).parent / "model_artifacts"
 # ─────────────────────────────────────────────────────────────────────────
 # LOAD MODEL ARTIFACTS  (no sample_flows.csv needed)
 # ─────────────────────────────────────────────────────────────────────────
+def _load(name):
+    """Load one artifact and report exactly which file failed and why."""
+    path = ARTIFACT_DIR / name
+    if not path.exists():
+        raise FileNotFoundError(f"{name} not found at {path}")
+    size = path.stat().st_size
+    try:
+        return joblib.load(path)
+    except BaseException as e:  # includes MemoryError
+        raise RuntimeError(
+            f"{name} ({size / 1e6:.2f} MB) failed to load -> "
+            f"{type(e).__name__}: {e!r}"
+        ) from e
+
+
 @st.cache_resource
 def load_artifacts():
-    model = joblib.load(ARTIFACT_DIR / "xgboost_xids_model_pso.pkl")
-    scaler = joblib.load(ARTIFACT_DIR / "scaler.pkl")
-    le = joblib.load(ARTIFACT_DIR / "label_encoder.pkl")
-    selected_features = list(joblib.load(ARTIFACT_DIR / "pso_selected_features.pkl"))
-    selected_mask = np.asarray(joblib.load(ARTIFACT_DIR / "pso_selected_mask.pkl"))
-    all_feature_columns = list(joblib.load(ARTIFACT_DIR / "all_feature_columns.pkl"))
+    model = _load("xgboost_xids_model_pso.pkl")
+    scaler = _load("scaler.pkl")
+    le = _load("label_encoder.pkl")
+    selected_features = list(_load("pso_selected_features.pkl"))
+    selected_mask = np.asarray(_load("pso_selected_mask.pkl"))
+    all_feature_columns = list(_load("all_feature_columns.pkl"))
 
     # Model was trained on GPU; Streamlit Cloud is CPU only
     try:
@@ -64,9 +79,9 @@ try:
     (model, scaler, le, selected_features, selected_mask,
      all_feature_columns, explainer) = load_artifacts()
     ARTIFACTS_OK = True
-except Exception as e:
+except BaseException as e:
     ARTIFACTS_OK = False
-    LOAD_ERROR = str(e)
+    LOAD_ERROR = f"{type(e).__name__}: {e}"
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -208,6 +223,11 @@ if not ARTIFACTS_OK:
         "all_feature_columns.pkl.\n\n"
         f"Details: {LOAD_ERROR}"
     )
+    st.write("Files found in model_artifacts/:")
+    st.code("\n".join(
+        f"{f.name:40s} {f.stat().st_size / 1e6:10.3f} MB"
+        for f in sorted(ARTIFACT_DIR.glob("*"))
+    ) if ARTIFACT_DIR.exists() else f"Folder not found: {ARTIFACT_DIR}")
     st.stop()
 
 
