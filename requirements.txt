@@ -1,0 +1,8 @@
+streamlit
+pandas
+numpy
+matplotlib
+joblib
+shap
+xgboost
+scikit-learn
