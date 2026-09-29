@@ -1,7 +1,0 @@
-{
-  "accuracy": 0.98757,
-  "f1_score": 0.9830197935260723,
-  "train_time_sec": 36.92700910568237,
-  "n_features_used": 32,
-  "n_features_original": 57
-}
