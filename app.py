@@ -39,7 +39,7 @@ DARK_CSS = """
 """
 st.markdown(DARK_CSS, unsafe_allow_html=True)
 
-GROQ_MODEL = "openai/gpt-oss-20b"   # swap to "openai/gpt-oss-120b" for richer (slower) explanations
+GROQ_MODEL = "openai/gpt-oss-20b"
 
 # ─────────────────────────────────────────────────────────────────────────
 # LOAD MODEL ARTIFACTS
@@ -59,10 +59,14 @@ def load_artifacts():
 @st.cache_data
 def load_sample_flows():
     df = pd.read_csv("model_artifacts/sample_flows.csv")
+    label_col = df["Label"] if "Label" in df.columns else None
     missing = [c for c in all_feature_columns if c not in df.columns]
     for col in missing:
         df[col] = 0.0
-    return df[all_feature_columns]
+    out = df[all_feature_columns].copy()
+    if label_col is not None:
+        out["Label"] = label_col.values
+    return out
 
 
 try:
@@ -90,13 +94,10 @@ groq_client = get_groq_client()
 
 
 def generate_ai_explanation(predicted_class, confidence, top_features):
-    """Called ONLY for attack predictions. top_features: list of (name, shap_value)."""
     if groq_client is None:
         return "⚠ AI explanation unavailable — GROQ_API_KEY not configured in st.secrets."
 
-    feature_lines = "\n".join(
-        f"- {name}: SHAP impact {val:+.4f}" for name, val in top_features
-    )
+    feature_lines = "\n".join(f"- {name}: SHAP impact {val:+.4f}" for name, val in top_features)
     prompt = f"""You are a network security analyst assistant. A network intrusion detection
 system just flagged a traffic flow as an attack. Explain WHY in 2-3 short sentences,
 in plain English, for a security analyst reading a dashboard alert. Be specific and
@@ -105,8 +106,7 @@ technical but concise. Do not repeat the raw numbers verbatim — interpret them
 Predicted attack type: {predicted_class}
 Model confidence: {confidence:.1f}%
 
-Top contributing features (SHAP explainability values, positive = pushed toward this
-attack classification):
+Top contributing features (SHAP values, positive = pushed toward this classification):
 {feature_lines}
 
 Write only the explanation, no preamble, no headers."""
@@ -131,10 +131,11 @@ defaults = {
     "alerts_triggered": 0,
     "latencies": [],
     "alert_log": [],
-    "incident_log": [],   # full attack records -> exportable CSV
+    "incident_log": [],
     "last_result": None,
     "live_mode": False,
     "start_time": time.time(),
+    "batch_results": None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -163,17 +164,30 @@ def run_inference(raw_row_df):
         "explain_ms": (t2 - t1) * 1000,
         "total_ms": (t2 - t0) * 1000,
         "shap_values": shap_values,
-        "row_selected": row_selected,
+        "pred_idx": int(pred[0]),
     }
 
 
 def get_top_shap_features(result, top_k=5):
+    """Robust to every SHAP output shape:
+    - list of arrays, one per class (older SHAP versions)
+    - single 3D array (n_samples, n_features, n_classes)  <- newer SHAP, this was the crash
+    - single 2D array (n_samples, n_features) for binary/regression-style output
+    """
     sv = result["shap_values"]
+    pred_idx = result["pred_idx"]
+
     if isinstance(sv, list):
-        pred_class_idx = list(le.classes_).index(result["class"])
-        vals = np.array(sv[pred_class_idx])[0]
+        vals = np.asarray(sv[pred_idx])[0]
     else:
-        vals = np.array(sv)[0]
+        sv_arr = np.asarray(sv)
+        if sv_arr.ndim == 3:
+            vals = sv_arr[0, :, pred_idx]
+        else:
+            vals = sv_arr[0]
+
+    vals = np.asarray(vals).reshape(-1)  # guarantee 1D, no matter what came in
+    top_k = min(top_k, len(vals))
     order = np.argsort(np.abs(vals))[-top_k:][::-1]
     return [(selected_features[i], float(vals[i])) for i in order], vals, order
 
@@ -214,6 +228,42 @@ def log_result(result, source_label="live"):
     result["ai_message"] = ai_message
     result["is_attack"] = is_attack
     st.session_state.last_result = result
+    return result
+
+
+def render_result_panel(r):
+    badge_color = "#F0503C" if r["is_attack"] else "#2ECC71"
+    badge_text = "⚠ THREAT DETECTED" if r["is_attack"] else "✓ NORMAL TRAFFIC"
+    st.markdown(
+        f"<div style='padding:16px;border-radius:8px;background-color:#16283D;"
+        f"border-left:4px solid {badge_color}'>"
+        f"<span style='color:{badge_color};font-weight:bold;font-family:monospace'>{badge_text}</span><br>"
+        f"<span style='font-size:22px;font-weight:bold'>{r['class']}</span><br>"
+        f"<span style='color:#9DB0BD'>Confidence: {r['confidence']:.2f}%</span>"
+        f"</div>", unsafe_allow_html=True
+    )
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Inference", f"{r['inference_ms']:.2f} ms")
+    c2.metric("Explanation", f"{r['explain_ms']:.2f} ms")
+    c3.metric("Total Latency", f"{r['total_ms']:.2f} ms")
+    if r["is_attack"] and r.get("ai_message"):
+        st.markdown(f"<div class='ai-note'>🤖 <b>AI Analyst Note</b><br>{r['ai_message']}</div>",
+                    unsafe_allow_html=True)
+
+
+def render_shap_chart(r):
+    st.markdown("#### 🔬 Why this prediction — SHAP Explanation")
+    top_feats, vals, order = get_top_shap_features(r, top_k=10)
+    fig, ax = plt.subplots(figsize=(6, 4))
+    fig.patch.set_facecolor("#0D1B2A")
+    ax.set_facecolor("#0D1B2A")
+    colors = ["#F0503C" if v > 0 else "#1B9AAA" for v in vals[order]]
+    ax.barh([selected_features[i] for i in order][::-1], vals[order][::-1], color=colors[::-1])
+    ax.tick_params(colors="#E8EEF2")
+    ax.set_xlabel("SHAP value (impact on prediction)", color="#E8EEF2")
+    for spine in ax.spines.values():
+        spine.set_color("#29405A")
+    st.pyplot(fig)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -251,7 +301,7 @@ if groq_client is None:
 # ─────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ⚙️ Control Panel")
-    mode = st.radio("Mode", ["🔴 Live Traffic Simulation", "🧪 Manual Flow Testing"])
+    mode = st.radio("Mode", ["🔴 Live Traffic Simulation", "🧪 Manual Flow Testing", "📁 Batch CSV Upload"])
     st.markdown("---")
 
     if mode.startswith("🔴"):
@@ -303,128 +353,168 @@ m4.metric("Alert Rate", f"{detection_rate:.1f}%")
 st.markdown("<hr>", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────
-# MAIN CONTENT
+# MODE: LIVE SIMULATION
 # ─────────────────────────────────────────────────────────────────────────
-left, right = st.columns([1.3, 1])
-
-with left:
-    if mode.startswith("🔴"):
+if mode.startswith("🔴"):
+    left, right = st.columns([1.3, 1])
+    with left:
         st.markdown("#### 📡 Incoming Flow")
         placeholder_flow = st.empty()
 
         if st.session_state.live_mode:
-            row = sample_flows.sample(1).reset_index(drop=True)
+            feat_cols = [c for c in sample_flows.columns if c != "Label"]
+            row = sample_flows[feat_cols].sample(1).reset_index(drop=True)
             result = run_inference(row)
             log_result(result, source_label="live")
 
         if st.session_state.last_result:
-            r = st.session_state.last_result
-            badge_color = "#F0503C" if r["is_attack"] else "#2ECC71"
-            badge_text = "⚠ THREAT DETECTED" if r["is_attack"] else "✓ NORMAL TRAFFIC"
-
             with placeholder_flow.container():
-                st.markdown(
-                    f"<div style='padding:16px;border-radius:8px;background-color:#16283D;"
-                    f"border-left:4px solid {badge_color}'>"
-                    f"<span style='color:{badge_color};font-weight:bold;font-family:monospace'>{badge_text}</span><br>"
-                    f"<span style='font-size:22px;font-weight:bold'>{r['class']}</span><br>"
-                    f"<span style='color:#9DB0BD'>Confidence: {r['confidence']:.2f}%</span>"
-                    f"</div>", unsafe_allow_html=True
-                )
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Inference", f"{r['inference_ms']:.2f} ms")
-                c2.metric("Explanation", f"{r['explain_ms']:.2f} ms")
-                c3.metric("Total Latency", f"{r['total_ms']:.2f} ms")
-
-                if r["is_attack"] and r.get("ai_message"):
-                    st.markdown(
-                        f"<div class='ai-note'>🤖 <b>AI Analyst Note</b><br>{r['ai_message']}</div>",
-                        unsafe_allow_html=True
-                    )
+                render_result_panel(st.session_state.last_result)
         else:
             placeholder_flow.info("Toggle **Start live monitoring** in the sidebar to begin.")
 
-    else:
-        st.markdown("#### 🧪 Manual Flow Testing")
-        preset = None
-        pcol1, pcol2 = st.columns(2)
-        if pcol1.button("Load Normal Example"):
-            preset = "normal"
-        if pcol2.button("Load Attack Example"):
-            preset = "attack"
+        if st.session_state.last_result:
+            render_shap_chart(st.session_state.last_result)
 
-        preset_vals = {}
-        if preset == "normal" and len(sample_flows):
-            preset_vals = sample_flows.iloc[0].to_dict()
-        elif preset == "attack" and len(sample_flows) > 2:
-            preset_vals = sample_flows.iloc[2].to_dict()
-
-        with st.form("manual_form"):
-            user_input = {}
-            cols = st.columns(3)
-            for i, feat in enumerate(selected_features):
-                default_val = float(preset_vals.get(feat, 0.0))
-                user_input[feat] = cols[i % 3].number_input(feat, value=default_val, format="%.4f")
-            submitted = st.form_submit_button("🚀 Analyze Flow", type="primary")
-
-        if submitted:
-            row = pd.DataFrame([{col: user_input.get(col, 0) for col in all_feature_columns}])
-            result = run_inference(row)
-            log_result(result, source_label="manual")
-            r = st.session_state.last_result
-            badge_color = "#F0503C" if r["is_attack"] else "#2ECC71"
-            st.markdown(
-                f"<div style='padding:16px;border-radius:8px;background-color:#16283D;"
-                f"border-left:4px solid {badge_color}'>"
-                f"<span style='font-size:22px;font-weight:bold'>{r['class']}</span> "
-                f"<span style='color:#9DB0BD'>({r['confidence']:.2f}% confidence)</span><br>"
-                f"<span style='color:#9DB0BD'>Total latency: {r['total_ms']:.2f} ms</span>"
-                f"</div>", unsafe_allow_html=True
-            )
-            if r["is_attack"] and r.get("ai_message"):
+    with right:
+        st.markdown("#### 🚨 Live Alert Log")
+        if st.session_state.alert_log:
+            for entry in st.session_state.alert_log:
+                css_class = "alert-row-attack" if entry["is_attack"] else "alert-row-benign"
+                icon = "⚠️" if entry["is_attack"] else "✓"
                 st.markdown(
-                    f"<div class='ai-note'>🤖 <b>AI Analyst Note</b><br>{r['ai_message']}</div>",
+                    f"<div class='{css_class}'>{icon} <b>{entry['time']}</b> — {entry['class']} "
+                    f"<span style='color:#9DB0BD'>({entry['confidence']}, {entry['latency_ms']} ms, {entry['source']})</span></div>",
                     unsafe_allow_html=True
                 )
+        else:
+            st.info("No flows analyzed yet this session.")
 
-    if st.session_state.last_result:
-        st.markdown("#### 🔬 Why this prediction — SHAP Explanation")
-        r = st.session_state.last_result
-        top_feats, vals, order = get_top_shap_features(r, top_k=10)
-        fig, ax = plt.subplots(figsize=(6, 4))
-        fig.patch.set_facecolor("#0D1B2A")
-        ax.set_facecolor("#0D1B2A")
-        colors = ["#F0503C" if v > 0 else "#1B9AAA" for v in vals[order]]
-        ax.barh([selected_features[i] for i in order][::-1], vals[order][::-1], color=colors[::-1])
-        ax.tick_params(colors="#E8EEF2")
-        ax.set_xlabel("SHAP value (impact on prediction)", color="#E8EEF2")
-        for spine in ax.spines.values():
-            spine.set_color("#29405A")
-        st.pyplot(fig)
+        st.markdown("#### 📈 Latency Trend")
+        if len(st.session_state.latencies) > 1:
+            st.line_chart(pd.DataFrame({"latency_ms": st.session_state.latencies[-40:]}))
+        else:
+            st.caption("Appears after a few flows are analyzed.")
 
-with right:
-    st.markdown("#### 🚨 Live Alert Log")
-    if st.session_state.alert_log:
-        for entry in st.session_state.alert_log:
-            css_class = "alert-row-attack" if entry["is_attack"] else "alert-row-benign"
-            icon = "⚠️" if entry["is_attack"] else "✓"
-            st.markdown(
-                f"<div class='{css_class}'>{icon} <b>{entry['time']}</b> — {entry['class']} "
-                f"<span style='color:#9DB0BD'>({entry['confidence']}, {entry['latency_ms']} ms, {entry['source']})</span></div>",
-                unsafe_allow_html=True
-            )
-    else:
-        st.info("No flows analyzed yet this session.")
-
-    st.markdown("#### 📈 Latency Trend")
-    if len(st.session_state.latencies) > 1:
-        st.line_chart(pd.DataFrame({"latency_ms": st.session_state.latencies[-40:]}))
-    else:
-        st.caption("Appears after a few flows are analyzed.")
+    if st.session_state.live_mode:
+        time.sleep(refresh_rate)
+        st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────
-# AUTO-REFRESH FOR LIVE MODE
+# MODE: MANUAL TESTING  (presets now run inference immediately — no second click needed)
 # ─────────────────────────────────────────────────────────────────────────
-if mode.startswith("🔴") and st.session_state.live_mode:
-    time.sleep(refresh_rate)
-    st.rerun()
+elif mode.startswith("🧪"):
+    left, right = st.columns([1.3, 1])
+    with left:
+        st.markdown("#### 🧪 Manual Flow Testing")
+        st.caption("Preset buttons run the prediction immediately. Expand 'Custom values' below to type your own numbers.")
+
+        pcol1, pcol2 = st.columns(2)
+        benign_rows = sample_flows[sample_flows.get("Label", "") == "Benign"] if "Label" in sample_flows.columns else sample_flows.iloc[[0]]
+        attack_rows = sample_flows[sample_flows.get("Label", "") != "Benign"] if "Label" in sample_flows.columns else sample_flows.iloc[[2]]
+
+        if pcol1.button("✅ Load & Analyze Normal Example", use_container_width=True):
+            row = benign_rows.drop(columns=["Label"], errors="ignore").sample(1).reset_index(drop=True)
+            result = run_inference(row)
+            log_result(result, source_label="manual-preset")
+
+        if pcol2.button("🚨 Load & Analyze Attack Example", use_container_width=True):
+            row = attack_rows.drop(columns=["Label"], errors="ignore").sample(1).reset_index(drop=True)
+            result = run_inference(row)
+            log_result(result, source_label="manual-preset")
+
+        with st.expander("✏️ Custom values (advanced)"):
+            with st.form("manual_form"):
+                user_input = {}
+                cols = st.columns(3)
+                for i, feat in enumerate(selected_features):
+                    user_input[feat] = cols[i % 3].number_input(feat, value=0.0, format="%.4f")
+                submitted = st.form_submit_button("🚀 Analyze Custom Flow", type="primary")
+
+            if submitted:
+                row = pd.DataFrame([{col: user_input.get(col, 0) for col in all_feature_columns}])
+                result = run_inference(row)
+                log_result(result, source_label="manual-custom")
+
+        if st.session_state.last_result:
+            st.markdown("---")
+            render_result_panel(st.session_state.last_result)
+            render_shap_chart(st.session_state.last_result)
+
+    with right:
+        st.markdown("#### 🚨 Recent Results")
+        if st.session_state.alert_log:
+            for entry in st.session_state.alert_log:
+                css_class = "alert-row-attack" if entry["is_attack"] else "alert-row-benign"
+                icon = "⚠️" if entry["is_attack"] else "✓"
+                st.markdown(
+                    f"<div class='{css_class}'>{icon} <b>{entry['time']}</b> — {entry['class']} "
+                    f"<span style='color:#9DB0BD'>({entry['confidence']}, {entry['latency_ms']} ms, {entry['source']})</span></div>",
+                    unsafe_allow_html=True
+                )
+        else:
+            st.info("No flows analyzed yet this session.")
+
+# ─────────────────────────────────────────────────────────────────────────
+# MODE: BATCH CSV UPLOAD  (new — this was missing before)
+# ─────────────────────────────────────────────────────────────────────────
+else:
+    st.markdown("#### 📁 Batch CSV Upload")
+    st.caption(
+        "Upload a CSV of one or more flows. Columns can be any subset of the model's "
+        f"{len(all_feature_columns)} original features (or just the {len(selected_features)} "
+        "PSO-selected ones) — anything missing is treated as 0. Every row is classified, "
+        "and any attack row gets a Groq AI explanation + an incident log entry."
+    )
+
+    uploaded = st.file_uploader("Choose a CSV file", type=["csv"])
+
+    if uploaded is not None:
+        try:
+            batch_df = pd.read_csv(uploaded)
+            st.success(f"Loaded {len(batch_df)} row(s). Preview:")
+            st.dataframe(batch_df.head(10), use_container_width=True)
+
+            if st.button("🚀 Classify All Rows", type="primary"):
+                results_rows = []
+                progress = st.progress(0, text="Processing flows...")
+                for i in range(len(batch_df)):
+                    row = batch_df.iloc[[i]].drop(columns=["Label"], errors="ignore")
+                    result = run_inference(row)
+                    logged = log_result(result, source_label=f"batch-row-{i}")
+                    results_rows.append({
+                        "row": i,
+                        "predicted_class": logged["class"],
+                        "confidence_%": round(logged["confidence"], 2),
+                        "is_attack": logged["is_attack"],
+                        "total_latency_ms": round(logged["total_ms"], 2),
+                        "ai_explanation": logged.get("ai_message") or "",
+                    })
+                    progress.progress((i + 1) / len(batch_df), text=f"Processed {i+1}/{len(batch_df)}")
+
+                st.session_state.batch_results = pd.DataFrame(results_rows)
+                progress.empty()
+
+            if st.session_state.batch_results is not None:
+                st.markdown("#### Results")
+                res_df = st.session_state.batch_results
+
+                def highlight_attack(row):
+                    color = "background-color: rgba(240,80,60,0.15)" if row["is_attack"] else ""
+                    return [color] * len(row)
+
+                st.dataframe(res_df.style.apply(highlight_attack, axis=1), use_container_width=True)
+
+                n_attacks = int(res_df["is_attack"].sum())
+                st.info(f"{n_attacks} attack(s) detected out of {len(res_df)} flows analyzed.")
+
+                st.download_button(
+                    "⬇️ Download Batch Results (CSV)",
+                    data=res_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"xids_batch_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                )
+        except Exception as e:
+            st.error(f"Could not process this CSV: {e}")
+    else:
+        st.info("No file uploaded yet. You can use the `sample_flows.csv` in `model_artifacts/` as a template.")
