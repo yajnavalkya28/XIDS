@@ -68,13 +68,33 @@ def load_artifacts():
     return model, scaler, le, selected_features, selected_mask, all_feature_columns, explainer, medians
 
 
+BENIGN_FILE = "model_artifacts/benign_flows.csv"   # ✅ Normal button reads this file
+ATTACK_FILE = "model_artifacts/attack_flows.csv"   # 🚨 Attack button reads this file
+
+
+@st.cache_data
+def load_preset_file(path, default_label):
+    """Read one preset CSV -> model feature columns (+ Label). Missing columns are filled with 0."""
+    df = pd.read_csv(path)
+    df.columns = df.columns.str.strip()
+    label = df["Label"].astype(str).str.strip() if "Label" in df.columns else pd.Series([default_label] * len(df))
+    for col in [c for c in all_feature_columns if c not in df.columns]:
+        df[col] = 0.0
+    out = df[all_feature_columns].copy()
+    out["Label"] = label.values
+    return out
+
+
 @st.cache_data
 def load_sample_flows():
+    """Used by Live mode. Prefers the two separate files, falls back to sample_flows.csv."""
+    if os.path.exists(BENIGN_FILE) and os.path.exists(ATTACK_FILE):
+        return pd.concat([load_preset_file(BENIGN_FILE, "Benign"),
+                          load_preset_file(ATTACK_FILE, "Attack")], ignore_index=True)
     df = pd.read_csv("model_artifacts/sample_flows.csv")
     df.columns = df.columns.str.strip()
     label_col = df["Label"] if "Label" in df.columns else None
-    missing = [c for c in all_feature_columns if c not in df.columns]
-    for col in missing:
+    for col in [c for c in all_feature_columns if c not in df.columns]:
         df[col] = 0.0
     out = df[all_feature_columns].copy()
     if label_col is not None:
@@ -600,30 +620,43 @@ elif mode.startswith("🧪"):
         st.markdown("#### 🧪 Manual Flow Testing")
         st.caption("Preset buttons run the prediction immediately. Expand 'Custom values' below to type your own numbers.")
 
-        pcol1, pcol2 = st.columns(2)
-        if "Label" in sample_flows.columns:
-            is_benign_row = sample_flows["Label"].astype(str).str.strip().str.lower() == "benign"
-            benign_rows = sample_flows[is_benign_row]
-            attack_rows = sample_flows[~is_benign_row]
+        # ── Two separate preset files: one per button ──────────────────────────
+        if os.path.exists(BENIGN_FILE):
+            benign_rows = load_preset_file(BENIGN_FILE, "Benign")
         else:
-            benign_rows = sample_flows.iloc[[0]]
-            attack_rows = sample_flows.iloc[[min(2, len(sample_flows) - 1)]]
+            benign_rows = sample_flows[sample_flows["Label"].astype(str).str.lower() == "benign"]
+        if os.path.exists(ATTACK_FILE):
+            attack_rows = load_preset_file(ATTACK_FILE, "Attack")
+        else:
+            attack_rows = sample_flows[sample_flows["Label"].astype(str).str.lower() != "benign"]
 
-        if pcol1.button("✅ Load & Analyze Normal Example", use_container_width=True):
+        st.caption(f"✅ Normal button → `{BENIGN_FILE}` ({len(benign_rows)} rows)   |   "
+                   f"🚨 Attack button → `{ATTACK_FILE}` ({len(attack_rows)} rows)")
+
+        attack_types = ["Any attack type"] + sorted(attack_rows["Label"].astype(str).unique().tolist())
+        chosen_attack = st.selectbox("Attack type for the attack button", attack_types)
+        if chosen_attack != "Any attack type":
+            attack_rows = attack_rows[attack_rows["Label"].astype(str) == chosen_attack]
+
+        pcol1, pcol2 = st.columns(2)
+
+        if pcol1.button("✅ Normal Example", use_container_width=True):
             if len(benign_rows) == 0:
-                st.warning("No benign rows in sample_flows.csv.")
+                st.warning(f"No rows found in {BENIGN_FILE}.")
             else:
-                row = benign_rows.drop(columns=["Label"], errors="ignore").sample(1).reset_index(drop=True)
-                result = run_inference(row)
-                log_result(result, source_label="manual-preset")
+                picked = benign_rows.sample(1)
+                st.session_state["last_true_label"] = str(picked["Label"].iloc[0])
+                result = run_inference(picked.drop(columns=["Label"]).reset_index(drop=True))
+                log_result(result, source_label="manual-normal-file")
 
-        if pcol2.button("🚨 Load & Analyze Attack Example", use_container_width=True):
+        if pcol2.button("🚨 Attack Example", use_container_width=True):
             if len(attack_rows) == 0:
-                st.warning("No attack rows in sample_flows.csv.")
+                st.warning(f"No rows found in {ATTACK_FILE}.")
             else:
-                row = attack_rows.drop(columns=["Label"], errors="ignore").sample(1).reset_index(drop=True)
-                result = run_inference(row)
-                log_result(result, source_label="manual-preset")
+                picked = attack_rows.sample(1)
+                st.session_state["last_true_label"] = str(picked["Label"].iloc[0])
+                result = run_inference(picked.drop(columns=["Label"]).reset_index(drop=True))
+                log_result(result, source_label="manual-attack-file")
 
         with st.expander("✏️ Custom values (advanced)"):
             with st.form("manual_form"):
@@ -640,6 +673,8 @@ elif mode.startswith("🧪"):
 
         if st.session_state.last_result:
             st.markdown("---")
+            if st.session_state.get("last_true_label"):
+                st.caption(f"Row loaded from file — true label: **{st.session_state['last_true_label']}**")
             render_result_panel(st.session_state.last_result)
             render_shap_chart(st.session_state.last_result)
 
