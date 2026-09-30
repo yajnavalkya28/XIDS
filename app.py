@@ -132,89 +132,125 @@ groq_client = get_groq_client()
 # so more specific entries come before generic ones (e.g. "ddos" before "dos").
 # ─────────────────────────────────────────────────────────────────────────
 ATTACK_PROFILES = [
-    (("ddos", "loic", "hoic"), {
-        "family": "Distributed Denial of Service (volumetric flood)",
-        "mechanism": "Many sources hammer the target with a very high rate of packets/requests to exhaust bandwidth or connection capacity.",
-        "signature": "very short flow durations, huge packet/byte rates, tiny or uniform packet sizes, many SYNs with little or no reply traffic, very low inter-arrival times.",
-        "action": "rate-limit or blackhole the offending sources, enable SYN cookies / upstream scrubbing, and check load-balancer and firewall capacity.",
+    (("slowbody", "rudy"), {
+        "family": "Slow POST DoS (R-U-Dead-Yet / slow body)",
+        "mechanism": "Sends an HTTP POST that declares a huge Content-Length, then trickles the body a few bytes at a time so the server keeps the connection and worker busy.",
+        "signature": "very long flow duration, few packets, tiny forward payloads, long inter-arrival gaps and large idle times.",
+        "action": "set strict request-body timeouts and minimum data rates, cap connections per IP, and front the app with a reverse proxy or WAF.",
     }),
-    (("slowloris", "slowhttp", "slow http"), {
-        "family": "Slow-rate DoS (connection exhaustion)",
-        "mechanism": "The attacker opens many connections and sends tiny partial requests very slowly to keep server worker slots occupied.",
-        "signature": "very long flow durations, very few packets and bytes, large idle times, long inter-arrival gaps, tiny segments.",
-        "action": "shorten header/body timeouts, cap connections per source IP, and put a reverse proxy or WAF in front of the web server.",
+    (("slowread",), {
+        "family": "Slow Read DoS",
+        "mechanism": "Requests a large resource, then reads the response extremely slowly by advertising a tiny TCP receive window, keeping server sockets and buffers occupied.",
+        "signature": "long-lived flows, small forward requests, large backward data delivered slowly, very small initial window sizes and long idle gaps.",
+        "action": "enforce minimum read-rate timeouts, limit concurrent connections per client, and tune server socket timeouts.",
+    }),
+    (("slowloris", "slowhttp", "slowheaders"), {
+        "family": "Slow-header DoS (Slowloris family)",
+        "mechanism": "Opens many connections and sends incomplete HTTP headers very slowly so the server keeps every worker slot reserved.",
+        "signature": "very long flow durations, very few packets and bytes, large idle times, long inter-arrival gaps and tiny segments.",
+        "action": "shorten header timeouts, cap connections per source IP, and put a reverse proxy or WAF in front of the web server.",
+    }),
+    (("heartbleed",), {
+        "family": "Heartbleed (OpenSSL memory disclosure)",
+        "mechanism": "Malformed TLS heartbeat requests trick a vulnerable OpenSSL server into returning chunks of process memory.",
+        "signature": "long TLS session with a large backward payload relative to the small forward request, repeated heartbeat exchanges.",
+        "action": "patch OpenSSL immediately, rotate TLS private keys and certificates, and invalidate active sessions and credentials.",
     }),
     (("hulk",), {
         "family": "HTTP flood DoS (HULK)",
         "mechanism": "Generates large volumes of unique, obfuscated HTTP GET requests so caches cannot absorb them and the web server is overloaded.",
-        "signature": "short-to-medium flows carrying several small forward packets with PSH flags, repeated request bursts, small forward payloads, high request rate from a single source.",
+        "signature": "short-to-medium flows with several small forward packets, PSH flags, repeated request bursts and a high request rate from one source.",
         "action": "rate-limit HTTP requests per client, enable WAF bot rules, and check web-server CPU and connection queues.",
     }),
     (("goldeneye",), {
         "family": "HTTP DoS (GoldenEye)",
         "mechanism": "Sends HTTP keep-alive requests with randomized headers and no-cache directives to bypass caching and tie up server resources.",
         "signature": "keep-alive style flows, repeated PSH-flagged requests, moderate durations with regular inter-arrival timing.",
-        "action": "limit keep-alive requests per connection, enforce per-IP request quotas, and block the offending client via WAF.",
+        "action": "limit keep-alive requests per connection, enforce per-IP request quotas, and block the client via WAF.",
     }),
-    (("heartbleed",), {
-        "family": "Heartbleed (OpenSSL memory disclosure)",
-        "mechanism": "Malformed TLS heartbeat requests trick a vulnerable OpenSSL server into returning chunks of process memory.",
-        "signature": "very long TLS session with a large backward payload relative to the small forward request, repeated heartbeat exchanges.",
-        "action": "patch OpenSSL immediately, rotate TLS private keys and certificates, and invalidate active sessions and credentials.",
+    (("ddossim",), {
+        "family": "Application-layer DDoS (DDOSIM simulator)",
+        "mechanism": "Simulates many legitimate-looking clients opening full TCP connections and sending HTTP requests to exhaust server connection and application capacity.",
+        "signature": "completed TCP handshakes from many sources, short flows with a few request packets, regular timing, modest packet sizes.",
+        "action": "apply per-source connection and request limits, enable SYN/connection-rate protection, and scale or scrub at the edge.",
+    }),
+    (("hoic", "loic"), {
+        "family": "HTTP flood DDoS (HOIC / LOIC-HTTP)",
+        "mechanism": "A crowd of hosts runs LOIC/HOIC to flood the target with high volumes of HTTP requests, often with randomized headers to defeat simple filters.",
+        "signature": "many short flows with repeated small HTTP request packets, PSH flags, high packet rate and little variation in size.",
+        "action": "rate-limit and challenge HTTP clients at the WAF/CDN, block offending source ranges, and enable upstream DDoS scrubbing.",
+    }),
+    (("-dns", "-ntp", "-ldap", "-mssql", "-netbios", "-snmp", "-tftp"), {
+        "family": "Reflection / amplification DDoS",
+        "mechanism": "The attacker sends small spoofed queries to public servers (DNS, NTP, LDAP, MSSQL, NetBIOS, SNMP or TFTP) that reply with much larger responses toward the victim.",
+        "signature": "one-directional UDP flows, large response-sized packets with little or no return traffic, very short durations and very high packet and byte rates.",
+        "action": "block the abused UDP service port at the edge, apply ingress filtering and rate limits, and request upstream scrubbing; confirm the victim is not running an open resolver.",
+    }),
+    (("syn",), {
+        "family": "SYN flood DDoS",
+        "mechanism": "Floods the target with TCP SYN packets, often with spoofed sources, filling the half-open connection table so real clients cannot connect.",
+        "signature": "tiny one-to-few-packet flows, SYN flag set, no payload, no completed handshake and very high packet rate.",
+        "action": "enable SYN cookies, reduce SYN-RECEIVED timeouts, apply SYN rate limiting and upstream filtering.",
+    }),
+    (("udp",), {
+        "family": "UDP flood DDoS",
+        "mechanism": "Saturates the target's bandwidth or a UDP service (including game-lag tools) with high volumes of UDP datagrams.",
+        "signature": "one-directional UDP flows, uniform packet sizes, extremely high packet and byte rates, very short inter-arrival times.",
+        "action": "rate-limit or drop unneeded UDP at the edge, apply ACLs for the targeted port, and use upstream scrubbing.",
+    }),
+    (("ddos", "dos"), {
+        "family": "Denial of Service / DDoS flood",
+        "mechanism": "Overwhelms the service with excessive packets, requests or connections to exhaust bandwidth or capacity.",
+        "signature": "very short durations, high packet and byte rates, small or uniform packet sizes and very low inter-arrival times.",
+        "action": "rate-limit or blackhole the offending sources, enable upstream scrubbing, and check load-balancer and firewall capacity.",
     }),
     (("portscan", "port scan"), {
         "family": "Reconnaissance (port scan)",
         "mechanism": "The scanner probes many ports to discover open services, typically with one crafted SYN per port.",
-        "signature": "single-packet or two-packet flows, near-zero duration, SYN flag with no payload, RST/absent replies, varied window sizes typical of scanning tools.",
+        "signature": "single-packet or two-packet flows, near-zero duration, SYN flag with no payload, RST or absent replies, window sizes typical of scanning tools.",
         "action": "identify and block the scanning source, review which ports responded, and tighten firewall exposure.",
     }),
     (("ftp",), {
         "family": "FTP brute force (credential guessing)",
-        "mechanism": "Automated tool repeatedly attempts FTP logins with many username/password combinations.",
-        "signature": "many short, similar sessions with small forward packets, PSH flags for each login attempt, small consistent reply sizes, regular inter-arrival timing.",
-        "action": "lock or throttle the source after failed logins, enable fail2ban, disable anonymous or password FTP, and audit for successful logins.",
+        "mechanism": "An automated tool repeatedly attempts FTP logins with many username/password combinations.",
+        "signature": "many short, similar sessions with small forward packets, PSH flags per login attempt, small consistent reply sizes and regular timing.",
+        "action": "lock or throttle the source after failed logins, enable fail2ban, disable anonymous or plain-password FTP, and audit for successful logins.",
     }),
     (("ssh",), {
         "family": "SSH brute force (credential guessing)",
-        "mechanism": "Automated tool repeatedly attempts SSH logins with many credential pairs against the same service.",
-        "signature": "repeated short encrypted sessions with a small, uniform packet count, PSH flags, consistent window sizes, regular timing between attempts.",
+        "mechanism": "An automated tool repeatedly attempts SSH logins with many credential pairs against the same service.",
+        "signature": "repeated short encrypted sessions with a small uniform packet count, PSH flags, consistent window sizes and regular timing between attempts.",
         "action": "block or throttle the source, enforce key-based auth, enable fail2ban, and audit auth logs for any successful login.",
     }),
     (("sql",), {
-        "family": "Web attack — SQL injection",
+        "family": "Web attack: SQL injection",
         "mechanism": "Malicious SQL fragments are injected through web request parameters to read or modify the database.",
         "signature": "HTTP flows with unusually large forward payloads (long crafted query strings), PSH-flagged requests and larger-than-normal responses.",
         "action": "review web and database logs for the offending queries, enable parameterized queries and WAF SQLi rules, and check for data exfiltration.",
     }),
     (("xss",), {
-        "family": "Web attack — Cross-Site Scripting (XSS)",
+        "family": "Web attack: Cross-Site Scripting (XSS)",
         "mechanism": "Script payloads are injected into web parameters so they execute in other users' browsers.",
-        "signature": "HTTP flows with larger forward payloads containing crafted parameters, repeated similar requests, PSH-flagged request packets.",
+        "signature": "HTTP flows with larger forward payloads containing crafted parameters, repeated similar requests and PSH-flagged request packets.",
         "action": "inspect the targeted endpoints, enforce input sanitization and output encoding, and enable a Content-Security-Policy and WAF rules.",
     }),
-    (("web attack", "brute force"), {
+    (("webattack", "web attack", "bruteforce", "brute force"), {
         "family": "Web brute force (login guessing over HTTP)",
         "mechanism": "Automated repeated login requests against a web form or endpoint to guess valid credentials.",
         "signature": "many similar short HTTP flows with small POST-style payloads, PSH flags and steady inter-arrival timing.",
-        "action": "add rate-limiting/CAPTCHA to login endpoints, lock accounts after repeated failures, and review auth logs for successful logins.",
+        "action": "add rate-limiting or CAPTCHA to login endpoints, lock accounts after repeated failures, and review auth logs for successful logins.",
     }),
     (("bot",), {
         "family": "Botnet command-and-control activity",
         "mechanism": "A compromised host beacons to a C2 server to fetch instructions or exfiltrate data.",
-        "signature": "periodic, regular-interval small exchanges, consistent packet sizes, long-lived or repeated sessions to the same endpoint.",
+        "signature": "periodic, regular-interval small exchanges, consistent packet sizes and long-lived or repeated sessions to the same endpoint.",
         "action": "isolate the infected host, block the C2 destination, and run endpoint malware scanning and credential rotation.",
     }),
     (("infil",), {
         "family": "Infiltration (post-exploitation activity)",
         "mechanism": "A compromised internal host is used to download tools, move laterally or stage data for exfiltration.",
-        "signature": "unusual long or bursty sessions with asymmetric byte volumes and atypical idle/active timing compared to normal traffic.",
+        "signature": "unusual long or bursty sessions with asymmetric byte volumes and atypical idle/active timing compared with normal traffic.",
         "action": "isolate the host, review its recent connections and processes, and hunt for lateral movement.",
-    }),
-    (("dos",), {
-        "family": "Denial of Service",
-        "mechanism": "A single source overwhelms the service with excessive requests or connections to degrade availability.",
-        "signature": "abnormal packet or request rates from one source with unusual duration and inter-arrival patterns.",
-        "action": "rate-limit or block the source and check service load and connection tables.",
     }),
 ]
 
@@ -334,14 +370,19 @@ for k, v in defaults.items():
         st.session_state[k] = v
 
 
-def run_inference(raw_row_df):
-    raw_row_df = raw_row_df.copy()
-    raw_row_df.columns = [str(c).strip() for c in raw_row_df.columns]
-    raw_row_df = raw_row_df.reindex(columns=all_feature_columns)
-    raw_row_df = raw_row_df.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+def prepare_raw(df):
+    """Clean any dataframe into the model's raw feature layout (strip names, numeric, no inf/NaN)."""
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.reindex(columns=all_feature_columns)
+    df = df.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
     if medians is not None:
-        raw_row_df = raw_row_df.fillna(medians)
-    raw_row_df = raw_row_df.fillna(0.0)
+        df = df.fillna(medians)
+    return df.fillna(0.0)
+
+
+def run_inference(raw_row_df):
+    raw_row_df = prepare_raw(raw_row_df)
 
     row_scaled = scaler.transform(raw_row_df[all_feature_columns])
     row_selected = row_scaled[:, selected_mask]
@@ -634,7 +675,7 @@ elif mode.startswith("🧪"):
                    f"🚨 Attack button → `{ATTACK_FILE}` ({len(attack_rows)} rows)")
 
         attack_types = ["Any attack type"] + sorted(attack_rows["Label"].astype(str).unique().tolist())
-        chosen_attack = st.selectbox("Attack type for the attack button", attack_types)
+        chosen_attack = st.selectbox("Attack type for the attack button (Any = cycles through all types)", attack_types)
         if chosen_attack != "Any attack type":
             attack_rows = attack_rows[attack_rows["Label"].astype(str) == chosen_attack]
 
@@ -653,10 +694,42 @@ elif mode.startswith("🧪"):
             if len(attack_rows) == 0:
                 st.warning(f"No rows found in {ATTACK_FILE}.")
             else:
-                picked = attack_rows.sample(1)
+                if chosen_attack == "Any attack type":
+                    # cycle through EVERY attack type in turn, so each click shows a different one
+                    types_list = sorted(attack_rows["Label"].astype(str).unique().tolist())
+                    idx = st.session_state.get("attack_cycle", 0) % len(types_list)
+                    st.session_state["attack_cycle"] = idx + 1
+                    pool = attack_rows[attack_rows["Label"].astype(str) == types_list[idx]]
+                else:
+                    pool = attack_rows
+                picked = pool.sample(1)
                 st.session_state["last_true_label"] = str(picked["Label"].iloc[0])
                 result = run_inference(picked.drop(columns=["Label"]).reset_index(drop=True))
                 log_result(result, source_label="manual-attack-file")
+
+        with st.expander("📊 Detection report — how well does the model catch each attack type?"):
+            st.caption(f"Runs the model over every row of `{ATTACK_FILE}` (no SHAP / AI, so it is fast).")
+            if st.button("Run detection report"):
+                if not os.path.exists(ATTACK_FILE):
+                    st.warning(f"{ATTACK_FILE} not found.")
+                else:
+                    full = load_preset_file(ATTACK_FILE, "Attack")
+                    raw = prepare_raw(full.drop(columns=["Label"]))
+                    proba = model.predict_proba(scaler.transform(raw[all_feature_columns])[:, selected_mask])
+                    rep = pd.DataFrame({
+                        "true_label": full["Label"].astype(str).values,
+                        "predicted": le.inverse_transform(proba.argmax(1)),
+                        "conf": proba.max(1) * 100,
+                    })
+                    rep["detected"] = rep["predicted"].str.strip().str.lower() != "benign"
+                    table = rep.groupby("true_label").agg(
+                        rows=("true_label", "size"),
+                        detected_pct=("detected", lambda x: round(x.mean() * 100, 1)),
+                        most_common_prediction=("predicted", lambda x: x.mode().iloc[0]),
+                        avg_confidence=("conf", lambda x: round(x.mean(), 1)),
+                    ).sort_values("detected_pct")
+                    st.dataframe(table, use_container_width=True)
+                    st.info(f"Overall: {rep['detected'].mean() * 100:.1f}% of attack rows flagged as an attack.")
 
         with st.expander("✏️ Custom values (advanced)"):
             with st.form("manual_form"):
@@ -673,8 +746,12 @@ elif mode.startswith("🧪"):
 
         if st.session_state.last_result:
             st.markdown("---")
-            if st.session_state.get("last_true_label"):
-                st.caption(f"Row loaded from file — true label: **{st.session_state['last_true_label']}**")
+            true_lbl = st.session_state.get("last_true_label")
+            if true_lbl:
+                st.caption(f"Row loaded from file — true label: **{true_lbl}**")
+                if (st.session_state.last_result["class"].strip().lower() == "benign"
+                        and true_lbl.strip().lower() != "benign"):
+                    st.warning(f"Model missed this one: true label is **{true_lbl}** but it predicted Benign.")
             render_result_panel(st.session_state.last_result)
             render_shap_chart(st.session_state.last_result)
 
