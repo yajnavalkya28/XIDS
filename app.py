@@ -1,3 +1,5 @@
+import html
+import os
 import time
 from datetime import datetime
 
@@ -51,26 +53,38 @@ def load_artifacts():
     le = joblib.load("model_artifacts/label_encoder.pkl")
     selected_features = joblib.load("model_artifacts/pso_selected_features.pkl")
     selected_mask = joblib.load("model_artifacts/pso_selected_mask.pkl")
-    all_feature_columns = joblib.load("model_artifacts/all_feature_columns.pkl")
+    all_feature_columns = [str(c).strip() for c in joblib.load("model_artifacts/all_feature_columns.pkl")]
     explainer = shap.TreeExplainer(model)
-    return model, scaler, le, selected_features, selected_mask, all_feature_columns, explainer
+
+    # Optional: training medians used to fill missing columns (better than 0).
+    medians = None
+    if os.path.exists("model_artifacts/feature_medians.pkl"):
+        try:
+            medians = pd.Series(joblib.load("model_artifacts/feature_medians.pkl"))
+            medians.index = [str(c).strip() for c in medians.index]
+        except Exception:
+            medians = None
+
+    return model, scaler, le, selected_features, selected_mask, all_feature_columns, explainer, medians
 
 
 @st.cache_data
 def load_sample_flows():
     df = pd.read_csv("model_artifacts/sample_flows.csv")
+    df.columns = df.columns.str.strip()
     label_col = df["Label"] if "Label" in df.columns else None
     missing = [c for c in all_feature_columns if c not in df.columns]
     for col in missing:
         df[col] = 0.0
     out = df[all_feature_columns].copy()
     if label_col is not None:
-        out["Label"] = label_col.values
+        out["Label"] = label_col.astype(str).str.strip().values
     return out
 
 
 try:
-    model, scaler, le, selected_features, selected_mask, all_feature_columns, explainer = load_artifacts()
+    (model, scaler, le, selected_features, selected_mask,
+     all_feature_columns, explainer, medians) = load_artifacts()
     sample_flows = load_sample_flows()
     ARTIFACTS_OK = True
 except Exception as e:
@@ -92,35 +106,193 @@ def get_groq_client():
 
 groq_client = get_groq_client()
 
+# ─────────────────────────────────────────────────────────────────────────
+# ATTACK KNOWLEDGE BASE  (makes every explanation specific to the attack type)
+# Matching is by keywords in the lower-cased class name, first match wins,
+# so more specific entries come before generic ones (e.g. "ddos" before "dos").
+# ─────────────────────────────────────────────────────────────────────────
+ATTACK_PROFILES = [
+    (("ddos", "loic", "hoic"), {
+        "family": "Distributed Denial of Service (volumetric flood)",
+        "mechanism": "Many sources hammer the target with a very high rate of packets/requests to exhaust bandwidth or connection capacity.",
+        "signature": "very short flow durations, huge packet/byte rates, tiny or uniform packet sizes, many SYNs with little or no reply traffic, very low inter-arrival times.",
+        "action": "rate-limit or blackhole the offending sources, enable SYN cookies / upstream scrubbing, and check load-balancer and firewall capacity.",
+    }),
+    (("slowloris", "slowhttp", "slow http"), {
+        "family": "Slow-rate DoS (connection exhaustion)",
+        "mechanism": "The attacker opens many connections and sends tiny partial requests very slowly to keep server worker slots occupied.",
+        "signature": "very long flow durations, very few packets and bytes, large idle times, long inter-arrival gaps, tiny segments.",
+        "action": "shorten header/body timeouts, cap connections per source IP, and put a reverse proxy or WAF in front of the web server.",
+    }),
+    (("hulk",), {
+        "family": "HTTP flood DoS (HULK)",
+        "mechanism": "Generates large volumes of unique, obfuscated HTTP GET requests so caches cannot absorb them and the web server is overloaded.",
+        "signature": "short-to-medium flows carrying several small forward packets with PSH flags, repeated request bursts, small forward payloads, high request rate from a single source.",
+        "action": "rate-limit HTTP requests per client, enable WAF bot rules, and check web-server CPU and connection queues.",
+    }),
+    (("goldeneye",), {
+        "family": "HTTP DoS (GoldenEye)",
+        "mechanism": "Sends HTTP keep-alive requests with randomized headers and no-cache directives to bypass caching and tie up server resources.",
+        "signature": "keep-alive style flows, repeated PSH-flagged requests, moderate durations with regular inter-arrival timing.",
+        "action": "limit keep-alive requests per connection, enforce per-IP request quotas, and block the offending client via WAF.",
+    }),
+    (("heartbleed",), {
+        "family": "Heartbleed (OpenSSL memory disclosure)",
+        "mechanism": "Malformed TLS heartbeat requests trick a vulnerable OpenSSL server into returning chunks of process memory.",
+        "signature": "very long TLS session with a large backward payload relative to the small forward request, repeated heartbeat exchanges.",
+        "action": "patch OpenSSL immediately, rotate TLS private keys and certificates, and invalidate active sessions and credentials.",
+    }),
+    (("portscan", "port scan"), {
+        "family": "Reconnaissance (port scan)",
+        "mechanism": "The scanner probes many ports to discover open services, typically with one crafted SYN per port.",
+        "signature": "single-packet or two-packet flows, near-zero duration, SYN flag with no payload, RST/absent replies, varied window sizes typical of scanning tools.",
+        "action": "identify and block the scanning source, review which ports responded, and tighten firewall exposure.",
+    }),
+    (("ftp",), {
+        "family": "FTP brute force (credential guessing)",
+        "mechanism": "Automated tool repeatedly attempts FTP logins with many username/password combinations.",
+        "signature": "many short, similar sessions with small forward packets, PSH flags for each login attempt, small consistent reply sizes, regular inter-arrival timing.",
+        "action": "lock or throttle the source after failed logins, enable fail2ban, disable anonymous or password FTP, and audit for successful logins.",
+    }),
+    (("ssh",), {
+        "family": "SSH brute force (credential guessing)",
+        "mechanism": "Automated tool repeatedly attempts SSH logins with many credential pairs against the same service.",
+        "signature": "repeated short encrypted sessions with a small, uniform packet count, PSH flags, consistent window sizes, regular timing between attempts.",
+        "action": "block or throttle the source, enforce key-based auth, enable fail2ban, and audit auth logs for any successful login.",
+    }),
+    (("sql",), {
+        "family": "Web attack — SQL injection",
+        "mechanism": "Malicious SQL fragments are injected through web request parameters to read or modify the database.",
+        "signature": "HTTP flows with unusually large forward payloads (long crafted query strings), PSH-flagged requests and larger-than-normal responses.",
+        "action": "review web and database logs for the offending queries, enable parameterized queries and WAF SQLi rules, and check for data exfiltration.",
+    }),
+    (("xss",), {
+        "family": "Web attack — Cross-Site Scripting (XSS)",
+        "mechanism": "Script payloads are injected into web parameters so they execute in other users' browsers.",
+        "signature": "HTTP flows with larger forward payloads containing crafted parameters, repeated similar requests, PSH-flagged request packets.",
+        "action": "inspect the targeted endpoints, enforce input sanitization and output encoding, and enable a Content-Security-Policy and WAF rules.",
+    }),
+    (("web attack", "brute force"), {
+        "family": "Web brute force (login guessing over HTTP)",
+        "mechanism": "Automated repeated login requests against a web form or endpoint to guess valid credentials.",
+        "signature": "many similar short HTTP flows with small POST-style payloads, PSH flags and steady inter-arrival timing.",
+        "action": "add rate-limiting/CAPTCHA to login endpoints, lock accounts after repeated failures, and review auth logs for successful logins.",
+    }),
+    (("bot",), {
+        "family": "Botnet command-and-control activity",
+        "mechanism": "A compromised host beacons to a C2 server to fetch instructions or exfiltrate data.",
+        "signature": "periodic, regular-interval small exchanges, consistent packet sizes, long-lived or repeated sessions to the same endpoint.",
+        "action": "isolate the infected host, block the C2 destination, and run endpoint malware scanning and credential rotation.",
+    }),
+    (("infil",), {
+        "family": "Infiltration (post-exploitation activity)",
+        "mechanism": "A compromised internal host is used to download tools, move laterally or stage data for exfiltration.",
+        "signature": "unusual long or bursty sessions with asymmetric byte volumes and atypical idle/active timing compared to normal traffic.",
+        "action": "isolate the host, review its recent connections and processes, and hunt for lateral movement.",
+    }),
+    (("dos",), {
+        "family": "Denial of Service",
+        "mechanism": "A single source overwhelms the service with excessive requests or connections to degrade availability.",
+        "signature": "abnormal packet or request rates from one source with unusual duration and inter-arrival patterns.",
+        "action": "rate-limit or block the source and check service load and connection tables.",
+    }),
+]
 
-def generate_ai_explanation(predicted_class, confidence, top_features):
+DEFAULT_PROFILE = {
+    "family": "Unclassified malicious traffic",
+    "mechanism": "Traffic pattern that deviates strongly from normal behavior learned by the model.",
+    "signature": "flow statistics that fall outside benign ranges.",
+    "action": "investigate the source and destination, review related logs, and consider temporary blocking.",
+}
+
+
+def get_attack_profile(class_name):
+    name = str(class_name).lower()
+    for keywords, profile in ATTACK_PROFILES:
+        if any(k in name for k in keywords):
+            return profile
+    return DEFAULT_PROFILE
+
+
+def fmt_val(v):
+    try:
+        v = float(v)
+    except Exception:
+        return str(v)
+    if abs(v) >= 1000:
+        return f"{v:,.0f}"
+    return f"{v:.4g}"
+
+
+def build_evidence(result, top_features):
+    raw = result["raw_row"].iloc[0]
+    lines = []
+    for name, shap_val in top_features:
+        val = raw[name] if name in raw.index else float("nan")
+        direction = "pushes toward" if shap_val > 0 else "pushes away from"
+        lines.append(f"- {name} = {fmt_val(val)} (SHAP {shap_val:+.3f}, {direction} {result['class']})")
+    return "\n".join(lines)
+
+
+def fallback_explanation(result, top_features):
+    """Rule-based note used if the LLM is unavailable or returns nothing."""
+    p = get_attack_profile(result["class"])
+    raw = result["raw_row"].iloc[0]
+    evid = ", ".join(f"{n}={fmt_val(raw.get(n, 0))}" for n, _ in top_features[:3])
+    return (f"{result['class']} ({p['family']}): the strongest evidence is {evid}, "
+            f"which matches the typical pattern of {p['signature']} "
+            f"Recommended action: {p['action']}")
+
+
+def _call_groq(prompt):
+    kwargs = dict(
+        model=GROQ_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
+        max_tokens=900,   # gpt-oss is a reasoning model: reasoning tokens count toward this limit
+    )
+    try:
+        resp = groq_client.chat.completions.create(**kwargs, reasoning_effort="low")
+    except Exception:
+        resp = groq_client.chat.completions.create(**kwargs)
+    return (resp.choices[0].message.content or "").strip()
+
+
+def generate_ai_explanation(result, top_features):
+    """Attack-specific analyst note. Never called for benign traffic."""
     if groq_client is None:
-        return "⚠ AI explanation unavailable — GROQ_API_KEY not configured in st.secrets."
+        return fallback_explanation(result, top_features)
 
-    feature_lines = "\n".join(f"- {name}: SHAP impact {val:+.4f}" for name, val in top_features)
-    prompt = f"""You are a network security analyst assistant. A network intrusion detection
-system just flagged a traffic flow as an attack. Explain WHY in 2-3 short sentences,
-in plain English, for a security analyst reading a dashboard alert. Be specific and
-technical but concise. Do not repeat the raw numbers verbatim — interpret them.
+    p = get_attack_profile(result["class"])
+    evidence = build_evidence(result, top_features)
+    others = ", ".join(f"{n} {c:.1f}%" for n, c in result["top_classes"][1:3])
 
-Predicted attack type: {predicted_class}
-Model confidence: {confidence:.1f}%
+    prompt = f"""You are a senior SOC analyst writing a dashboard alert note for ONE specific detection.
 
-Top contributing features (SHAP values, positive = pushed toward this classification):
-{feature_lines}
+Detected class: {result['class']}  ({p['family']})
+Model confidence: {result['confidence']:.1f}%
+Next most likely classes: {others}
 
-Write only the explanation, no preamble, no headers."""
+Background on this attack type:
+- How it works: {p['mechanism']}
+- Typical flow signature: {p['signature']}
+- Standard response: {p['action']}
+
+Evidence from THIS flow (raw values; times are in microseconds, rates per second):
+{evidence}
+
+Write exactly 3 sentences, plain text, no headers, no bullets, max 95 words total:
+1. Say what this specific attack is doing and tie it to the 2-3 strongest features above, interpreting their values (e.g. "0.4 ms duration with 3M packets means...").
+2. If a next-likely class is within about 15 points of the top one, say why it could be confused with {result['class']}; otherwise say what makes this flow a clear {result['class']} case.
+3. Give one concrete action specific to {result['class']}.
+
+Rules: name the attack type explicitly; never write generic phrases like "suspicious traffic" or "anomalous behavior"; do not invent IPs, ports or facts that are not in the evidence."""
 
     try:
-        response = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.4,
-            max_tokens=180,
-        )
-        return response.choices[0].message.content.strip()
+        text = _call_groq(prompt)
+        return text if text else fallback_explanation(result, top_features)
     except Exception as e:
-        return f"⚠ AI explanation failed: {e}"
+        return f"{fallback_explanation(result, top_features)}  (LLM unavailable: {e})"
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -143,7 +315,14 @@ for k, v in defaults.items():
 
 
 def run_inference(raw_row_df):
-    raw_row_df = raw_row_df.reindex(columns=all_feature_columns, fill_value=0.0)
+    raw_row_df = raw_row_df.copy()
+    raw_row_df.columns = [str(c).strip() for c in raw_row_df.columns]
+    raw_row_df = raw_row_df.reindex(columns=all_feature_columns)
+    raw_row_df = raw_row_df.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    if medians is not None:
+        raw_row_df = raw_row_df.fillna(medians)
+    raw_row_df = raw_row_df.fillna(0.0)
+
     row_scaled = scaler.transform(raw_row_df[all_feature_columns])
     row_selected = row_scaled[:, selected_mask]
 
@@ -157,23 +336,24 @@ def run_inference(raw_row_df):
     predicted_class = le.inverse_transform(pred)[0]
     confidence = float(pred_proba[0][pred[0]] * 100)
 
+    order = np.argsort(pred_proba[0])[::-1][:3]
+    top_classes = [(str(le.inverse_transform([int(i)])[0]), float(pred_proba[0][i] * 100)) for i in order]
+
     return {
         "class": predicted_class,
         "confidence": confidence,
+        "top_classes": top_classes,
         "inference_ms": (t1 - t0) * 1000,
         "explain_ms": (t2 - t1) * 1000,
         "total_ms": (t2 - t0) * 1000,
         "shap_values": shap_values,
         "pred_idx": int(pred[0]),
+        "raw_row": raw_row_df,
     }
 
 
 def get_top_shap_features(result, top_k=5):
-    """Robust to every SHAP output shape:
-    - list of arrays, one per class (older SHAP versions)
-    - single 3D array (n_samples, n_features, n_classes)  <- newer SHAP, this was the crash
-    - single 2D array (n_samples, n_features) for binary/regression-style output
-    """
+    """Robust to every SHAP output shape (list per class, 3D array, or 2D array)."""
     sv = result["shap_values"]
     pred_idx = result["pred_idx"]
 
@@ -186,7 +366,7 @@ def get_top_shap_features(result, top_k=5):
         else:
             vals = sv_arr[0]
 
-    vals = np.asarray(vals).reshape(-1)  # guarantee 1D, no matter what came in
+    vals = np.asarray(vals).reshape(-1)
     top_k = min(top_k, len(vals))
     order = np.argsort(np.abs(vals))[-top_k:][::-1]
     return [(selected_features[i], float(vals[i])) for i in order], vals, order
@@ -201,8 +381,8 @@ def log_result(result, source_label="live"):
     if is_attack:
         st.session_state.alerts_triggered += 1
         top_feats, _, _ = get_top_shap_features(result, top_k=5)
-        with st.spinner("🤖 Generating AI explanation..."):
-            ai_message = generate_ai_explanation(result["class"], result["confidence"], top_feats)
+        with st.spinner("🤖 Generating attack-specific analysis..."):
+            ai_message = generate_ai_explanation(result, top_feats)
 
         st.session_state.incident_log.insert(0, {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -247,8 +427,14 @@ def render_result_panel(r):
     c2.metric("Explanation", f"{r['explain_ms']:.2f} ms")
     c3.metric("Total Latency", f"{r['total_ms']:.2f} ms")
     if r["is_attack"] and r.get("ai_message"):
-        st.markdown(f"<div class='ai-note'>🤖 <b>AI Analyst Note</b><br>{r['ai_message']}</div>",
-                    unsafe_allow_html=True)
+        st.markdown(
+            f"<div class='ai-note'>🤖 <b>AI Analyst Note — {html.escape(r['class'])}</b><br>"
+            f"{html.escape(r['ai_message'])}</div>",
+            unsafe_allow_html=True,
+        )
+    with st.expander("Class probabilities (top 3)"):
+        for name, pct in r["top_classes"]:
+            st.write(f"{name}: {pct:.2f}%")
 
 
 def render_shap_chart(r):
@@ -264,6 +450,18 @@ def render_shap_chart(r):
     for spine in ax.spines.values():
         spine.set_color("#29405A")
     st.pyplot(fig)
+    plt.close(fig)
+
+
+def render_alert_log(entries):
+    for entry in entries:
+        css_class = "alert-row-attack" if entry["is_attack"] else "alert-row-benign"
+        icon = "⚠️" if entry["is_attack"] else "✓"
+        st.markdown(
+            f"<div class='{css_class}'>{icon} <b>{entry['time']}</b> — {html.escape(str(entry['class']))} "
+            f"<span style='color:#9DB0BD'>({entry['confidence']}, {entry['latency_ms']} ms, {entry['source']})</span></div>",
+            unsafe_allow_html=True,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -276,7 +474,7 @@ m, s = divmod(rem, 60)
 header_l, header_r = st.columns([3, 1])
 with header_l:
     st.markdown("## 🛡️ XIDS — Real-Time Network Intrusion Monitoring")
-    st.caption("XGBoost + PSO Feature Selection + SHAP · AI-generated analyst explanations via Groq")
+    st.caption("XGBoost + PSO Feature Selection + SHAP · attack-specific analyst explanations via Groq")
 with header_r:
     st.markdown(
         f"<div style='text-align:right'>"
@@ -292,8 +490,8 @@ if not ARTIFACTS_OK:
 
 if groq_client is None:
     st.warning(
-        "⚠ GROQ_API_KEY not found in st.secrets — AI explanations will show a placeholder "
-        "message until you add it (Streamlit Cloud: App settings → Secrets)."
+        "⚠ GROQ_API_KEY not found in st.secrets — attack notes will use the built-in rule-based "
+        "explanation until you add it (Streamlit Cloud: App settings → Secrets)."
     )
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -312,7 +510,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### 📊 Model Info")
-    st.caption(f"**Classifier:** XGBoost  |  **Explainer:** SHAP TreeExplainer")
+    st.caption("**Classifier:** XGBoost  |  **Explainer:** SHAP TreeExplainer")
     st.caption(f"**Features:** {len(selected_features)} (PSO-selected)  |  **Classes:** {len(le.classes_)}")
     st.caption(f"**AI model:** `{GROQ_MODEL}` (Groq)")
 
@@ -379,14 +577,7 @@ if mode.startswith("🔴"):
     with right:
         st.markdown("#### 🚨 Live Alert Log")
         if st.session_state.alert_log:
-            for entry in st.session_state.alert_log:
-                css_class = "alert-row-attack" if entry["is_attack"] else "alert-row-benign"
-                icon = "⚠️" if entry["is_attack"] else "✓"
-                st.markdown(
-                    f"<div class='{css_class}'>{icon} <b>{entry['time']}</b> — {entry['class']} "
-                    f"<span style='color:#9DB0BD'>({entry['confidence']}, {entry['latency_ms']} ms, {entry['source']})</span></div>",
-                    unsafe_allow_html=True
-                )
+            render_alert_log(st.session_state.alert_log)
         else:
             st.info("No flows analyzed yet this session.")
 
@@ -401,7 +592,7 @@ if mode.startswith("🔴"):
         st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────
-# MODE: MANUAL TESTING  (presets now run inference immediately — no second click needed)
+# MODE: MANUAL TESTING
 # ─────────────────────────────────────────────────────────────────────────
 elif mode.startswith("🧪"):
     left, right = st.columns([1.3, 1])
@@ -410,18 +601,29 @@ elif mode.startswith("🧪"):
         st.caption("Preset buttons run the prediction immediately. Expand 'Custom values' below to type your own numbers.")
 
         pcol1, pcol2 = st.columns(2)
-        benign_rows = sample_flows[sample_flows.get("Label", "") == "Benign"] if "Label" in sample_flows.columns else sample_flows.iloc[[0]]
-        attack_rows = sample_flows[sample_flows.get("Label", "") != "Benign"] if "Label" in sample_flows.columns else sample_flows.iloc[[2]]
+        if "Label" in sample_flows.columns:
+            is_benign_row = sample_flows["Label"].astype(str).str.strip().str.lower() == "benign"
+            benign_rows = sample_flows[is_benign_row]
+            attack_rows = sample_flows[~is_benign_row]
+        else:
+            benign_rows = sample_flows.iloc[[0]]
+            attack_rows = sample_flows.iloc[[min(2, len(sample_flows) - 1)]]
 
         if pcol1.button("✅ Load & Analyze Normal Example", use_container_width=True):
-            row = benign_rows.drop(columns=["Label"], errors="ignore").sample(1).reset_index(drop=True)
-            result = run_inference(row)
-            log_result(result, source_label="manual-preset")
+            if len(benign_rows) == 0:
+                st.warning("No benign rows in sample_flows.csv.")
+            else:
+                row = benign_rows.drop(columns=["Label"], errors="ignore").sample(1).reset_index(drop=True)
+                result = run_inference(row)
+                log_result(result, source_label="manual-preset")
 
         if pcol2.button("🚨 Load & Analyze Attack Example", use_container_width=True):
-            row = attack_rows.drop(columns=["Label"], errors="ignore").sample(1).reset_index(drop=True)
-            result = run_inference(row)
-            log_result(result, source_label="manual-preset")
+            if len(attack_rows) == 0:
+                st.warning("No attack rows in sample_flows.csv.")
+            else:
+                row = attack_rows.drop(columns=["Label"], errors="ignore").sample(1).reset_index(drop=True)
+                result = run_inference(row)
+                log_result(result, source_label="manual-preset")
 
         with st.expander("✏️ Custom values (advanced)"):
             with st.form("manual_form"):
@@ -432,7 +634,7 @@ elif mode.startswith("🧪"):
                 submitted = st.form_submit_button("🚀 Analyze Custom Flow", type="primary")
 
             if submitted:
-                row = pd.DataFrame([{col: user_input.get(col, 0) for col in all_feature_columns}])
+                row = pd.DataFrame([{col: user_input.get(col, np.nan) for col in all_feature_columns}])
                 result = run_inference(row)
                 log_result(result, source_label="manual-custom")
 
@@ -444,52 +646,57 @@ elif mode.startswith("🧪"):
     with right:
         st.markdown("#### 🚨 Recent Results")
         if st.session_state.alert_log:
-            for entry in st.session_state.alert_log:
-                css_class = "alert-row-attack" if entry["is_attack"] else "alert-row-benign"
-                icon = "⚠️" if entry["is_attack"] else "✓"
-                st.markdown(
-                    f"<div class='{css_class}'>{icon} <b>{entry['time']}</b> — {entry['class']} "
-                    f"<span style='color:#9DB0BD'>({entry['confidence']}, {entry['latency_ms']} ms, {entry['source']})</span></div>",
-                    unsafe_allow_html=True
-                )
+            render_alert_log(st.session_state.alert_log)
         else:
             st.info("No flows analyzed yet this session.")
 
 # ─────────────────────────────────────────────────────────────────────────
-# MODE: BATCH CSV UPLOAD  (new — this was missing before)
+# MODE: BATCH UPLOAD (CSV or Excel)
 # ─────────────────────────────────────────────────────────────────────────
 else:
-    st.markdown("#### 📁 Batch CSV Upload")
+    st.markdown("#### 📁 Batch CSV / Excel Upload")
     st.caption(
-        "Upload a CSV of one or more flows. Columns can be any subset of the model's "
+        "Upload a CSV or Excel file of one or more flows. Columns can be any subset of the model's "
         f"{len(all_feature_columns)} original features (or just the {len(selected_features)} "
-        "PSO-selected ones) — anything missing is treated as 0. Every row is classified, "
-        "and any attack row gets a Groq AI explanation + an incident log entry."
+        "PSO-selected ones) — missing ones are filled with training medians (or 0). Every row is "
+        "classified, and every attack row gets an attack-specific AI explanation + an incident log entry."
     )
 
-    uploaded = st.file_uploader("Choose a CSV file", type=["csv"])
+    uploaded = st.file_uploader("Choose a CSV or Excel file", type=["csv", "xlsx"])
 
     if uploaded is not None:
         try:
-            batch_df = pd.read_csv(uploaded)
-            st.success(f"Loaded {len(batch_df)} row(s). Preview:")
+            if uploaded.name.lower().endswith(".xlsx"):
+                batch_df = pd.read_excel(uploaded)
+            else:
+                batch_df = pd.read_csv(uploaded)
+            batch_df.columns = batch_df.columns.astype(str).str.strip()
+
+            matched = [c for c in all_feature_columns if c in batch_df.columns]
+            st.success(f"Loaded {len(batch_df)} row(s). Matched {len(matched)}/{len(all_feature_columns)} model features.")
+            if len(matched) == 0:
+                st.error("None of the column names match the model's features — every row would be identical. "
+                         "Check the column names in your file.")
             st.dataframe(batch_df.head(10), use_container_width=True)
 
-            if st.button("🚀 Classify All Rows", type="primary"):
+            if st.button("🚀 Classify All Rows", type="primary", disabled=len(matched) == 0):
                 results_rows = []
                 progress = st.progress(0, text="Processing flows...")
                 for i in range(len(batch_df)):
-                    row = batch_df.iloc[[i]].drop(columns=["Label"], errors="ignore")
+                    row = batch_df.iloc[[i]].drop(columns=["Label", "Sample_Type", "Expected"], errors="ignore")
                     result = run_inference(row)
                     logged = log_result(result, source_label=f"batch-row-{i}")
-                    results_rows.append({
+                    entry = {
                         "row": i,
                         "predicted_class": logged["class"],
                         "confidence_%": round(logged["confidence"], 2),
                         "is_attack": logged["is_attack"],
                         "total_latency_ms": round(logged["total_ms"], 2),
                         "ai_explanation": logged.get("ai_message") or "",
-                    })
+                    }
+                    if "Label" in batch_df.columns:
+                        entry["true_label"] = str(batch_df.iloc[i]["Label"])
+                    results_rows.append(entry)
                     progress.progress((i + 1) / len(batch_df), text=f"Processed {i+1}/{len(batch_df)}")
 
                 st.session_state.batch_results = pd.DataFrame(results_rows)
@@ -515,6 +722,6 @@ else:
                     mime="text/csv",
                 )
         except Exception as e:
-            st.error(f"Could not process this CSV: {e}")
+            st.error(f"Could not process this file: {e}")
     else:
         st.info("No file uploaded yet. You can use the `sample_flows.csv` in `model_artifacts/` as a template.")
